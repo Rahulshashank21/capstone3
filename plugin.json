@@ -5,6 +5,7 @@
   "entry": ".claude/agents/",
   "hooks": ".claude/hooks/",
   "skills": ".claude/skills/",
+  "commands": ".claude/commands/",
   "mcpServers": [
     "playwright"
   ]
