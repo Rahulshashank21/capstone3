@@ -1,9 +1,9 @@
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Dict, Any
+from typing import Dict
 from src.domain.models import ProRataCalculationException
 
 class ProRataCalculator:
-    """Fixed-point financial calculation engine for telecom subscription migrations."""
+    """Fixed-point financial calculation engine enforcing non-negative invariants and exact component sum matching."""
 
     TWO_PLACES = Decimal("0.01")
 
@@ -15,7 +15,6 @@ class ProRataCalculator:
         days_used: int,
         cycle_days: int
     ) -> Decimal:
-        """Computes total pro-rata charge enforcing strict financial precision and non-negative invariants."""
         itemized = cls.calculate_itemized(old_rent, new_rent, days_used, cycle_days)
         return itemized["total_charge"]
 
@@ -27,7 +26,6 @@ class ProRataCalculator:
         days_used: int,
         cycle_days: int
     ) -> Dict[str, Decimal]:
-        """Itemizes consumption charges across old and new tariff components."""
         if cycle_days <= 0:
             raise ProRataCalculationException("Billing cycle duration must be strictly positive", "ERR_INVALID_CYCLE_DAYS")
         if days_used < 0 or days_used > cycle_days:
@@ -44,17 +42,23 @@ class ProRataCalculator:
         cycle_days_dec = Decimal(str(cycle_days))
         days_remaining_dec = cycle_days_dec - days_used_dec
 
-        # Perform exact proportional division in Decimal
-        old_component = (days_used_dec / cycle_days_dec) * old_rent
-        new_component = (days_remaining_dec / cycle_days_dec) * new_rent
-        unrounded_total = old_component + new_component
+        # Exact boundary pinning
+        if days_used == 0:
+            old_charge = Decimal("0.00")
+            new_charge = new_rent.quantize(cls.TWO_PLACES, rounding=ROUND_HALF_UP)
+            total_charge = new_charge
+        elif days_used == cycle_days:
+            old_charge = old_rent.quantize(cls.TWO_PLACES, rounding=ROUND_HALF_UP)
+            new_charge = Decimal("0.00")
+            total_charge = old_charge
+        else:
+            old_raw = (days_used_dec / cycle_days_dec) * old_rent
+            new_raw = (days_remaining_dec / cycle_days_dec) * new_rent
+            total_raw = old_raw + new_raw
+            total_charge = total_raw.quantize(cls.TWO_PLACES, rounding=ROUND_HALF_UP)
+            old_charge = old_raw.quantize(cls.TWO_PLACES, rounding=ROUND_HALF_UP)
+            new_charge = total_charge - old_charge
 
-        # Round half-up to exact currency cents
-        old_charge = old_component.quantize(cls.TWO_PLACES, rounding=ROUND_HALF_UP)
-        new_charge = new_component.quantize(cls.TWO_PLACES, rounding=ROUND_HALF_UP)
-        total_charge = unrounded_total.quantize(cls.TWO_PLACES, rounding=ROUND_HALF_UP)
-
-        # Invariant Assertion: Non-negative charge
         if total_charge < Decimal("0.00"):
             raise ProRataCalculationException(
                 f"Pro-rata invariant failed: calculated total {total_charge} < 0.00",

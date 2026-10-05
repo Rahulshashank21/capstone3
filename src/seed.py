@@ -5,6 +5,8 @@ from src.services.subscription_service import SubscriptionService
 
 def seed_database(service: SubscriptionService) -> None:
     """Pre-populates the database with compliant telecom sample plans, subscribers, and audit trails."""
+    if service.plan_repo.count() > 0 or len(service.subscriber_repo.list_all()) > 0:
+        return
     # 1. Seed Plan Catalog (AC-03)
     p1 = service.create_plan(
         plan_id="PLAN-PRE-STARTER",
@@ -79,8 +81,10 @@ def seed_database(service: SubscriptionService) -> None:
 
     # Ported Out (Terminal)
     s6 = service.register_subscriber("9876543206", "ID-PROOF-KYC-06", PlanType.POSTPAID)
-    service.activate_subscriber(s6.subscriber_id, "VERIFIED", "DEALER_002", "APPROVED", "PLAN-POST-SILVER")
-    service.initiate_port_out(s6.subscriber_id)
+    s6 = service.activate_subscriber(s6.subscriber_id, "VERIFIED", "DEALER_002", "APPROVED", "PLAN-POST-SILVER")
+    s6 = service.initiate_port_out(s6.subscriber_id)
+    s6.port_out_requested_at = datetime.now(timezone.utc) - timedelta(days=8)
+    service.subscriber_repo.save(s6)
     service.finalize_port_out(s6.subscriber_id)
 
     print(f"[SEED] Successfully seeded {service.plan_repo.count()} plans and {len(service.subscriber_repo.list_all())} subscribers.")

@@ -30,6 +30,3 @@ class AuditRepository:
         with self._lock:
             return len(self._logs)
 
-    def clear(self) -> None:
-        with self._lock:
-            self._logs.clear()

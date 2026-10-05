@@ -1,0 +1,41 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/architecture-layering-check.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/pii-masking-check.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/plan-immutability-check.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/pro-rata-invariant-check.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "bash:pytest*",
+      "bash:python3*",
+      "bash:.claude/hooks/*"
+    ]
+  }
+}

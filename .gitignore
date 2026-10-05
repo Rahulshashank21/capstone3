@@ -8,3 +8,6 @@ htmlcov/
 node_modules/
 .env
 .DS_Store
+*.db
+*.sqlite
+*.sqlite3

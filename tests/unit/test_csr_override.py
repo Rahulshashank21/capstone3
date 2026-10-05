@@ -1,7 +1,7 @@
 import pytest
 from decimal import Decimal
 from src.domain.models import (
-    SubscriberState, PlanType, Role, UnauthorizedException, DomainException
+    SubscriberState, PlanType, Role, UnauthorizedException, DomainException, ActivationFailedException
 )
 from src.domain.csr_override_policy import CSROverridePolicy
 from src.services.subscription_service import SubscriptionService
@@ -18,12 +18,18 @@ def test_ac_09_csr_activation_override(service):
     """AC-09: CSR successfully overrides activation failure and records audit log."""
     sub = service.register_subscriber("9876543240", "ID-REJECTED-KYC", PlanType.PREPAID)
     
+    # Activation fails due to unverified KYC, creating rejection record
+    with pytest.raises(ActivationFailedException) as exc:
+        service.activate_subscriber(sub.subscriber_id, "REJECTED", "DEALER_001", "APPROVED", "PLAN-PRE-OVR")
+    rejection_id = exc.value.rejection_id
+
     # CSR overrides KYC block with valid reason code
     activated = service.csr_override_activation(
         subscriber_id=sub.subscriber_id,
         initial_plan_id="PLAN-PRE-OVR",
         actor_id="CSR_AGENT_42",
-        reason_code="OVERRIDE_KYC_MANUAL"
+        reason_code="OVERRIDE_KYC_MANUAL",
+        rejection_id=rejection_id
     )
     assert activated.state == SubscriberState.ACTIVE
     assert activated.current_plan_id == "PLAN-PRE-OVR"
@@ -34,6 +40,18 @@ def test_ac_09_csr_activation_override(service):
     assert logs[0].role == Role.CSR
     assert logs[0].reason_code == "OVERRIDE_KYC_MANUAL"
     assert logs[0].action == "CSR_ACTIVATION_OVERRIDE"
+
+def test_csr_override_without_rejection_record_rejected(service):
+    """Unconditional CSR override without prior rejection is blocked."""
+    sub = service.register_subscriber("9876543249", "ID-NO-REJ", PlanType.PREPAID)
+    with pytest.raises(DomainException) as exc:
+        service.csr_override_activation(
+            subscriber_id=sub.subscriber_id,
+            initial_plan_id="PLAN-PRE-OVR",
+            actor_id="CSR_AGENT_42",
+            reason_code="OVERRIDE_KYC_MANUAL"
+        )
+    assert exc.value.reason_code == "ERR_REJECTION_REQUIRED"
 
 def test_ac_09_csr_tenure_override_for_plan_change(service):
     """AC-09: CSR overrides minimum tenure requirement with OVERRIDE_TENURE_WAIVER."""

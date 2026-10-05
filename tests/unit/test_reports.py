@@ -1,4 +1,5 @@
 import pytest
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from src.domain.models import SubscriberState, PlanType
 from src.services.subscription_service import SubscriptionService
@@ -30,6 +31,8 @@ def populated_system():
     s5 = srv.register_subscriber("9876543254", "ID-5", PlanType.POSTPAID)
     srv.activate_subscriber(s5.subscriber_id, "VERIFIED", "DEALER_001", "APPROVED", "PLAN-POST-1")
     srv.initiate_port_out(s5.subscriber_id)
+    s5.port_out_requested_at = datetime.now(timezone.utc) - timedelta(days=8)
+    srv.subscriber_repo.save(s5)
     srv.finalize_port_out(s5.subscriber_id)
 
     # 6. Suspended

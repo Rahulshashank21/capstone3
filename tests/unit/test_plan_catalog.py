@@ -77,3 +77,46 @@ def test_ac_03_plan_version_incrementing():
     retrieved_v2 = srv.get_plan("PLAN-EVOLVE", version=2)
     assert retrieved_v1.monthly_rent == Decimal("30.00")
     assert retrieved_v2.monthly_rent == Decimal("35.00")
+
+def test_plan_attribute_validations():
+    """Validates boundary constraints on plan attributes."""
+    from src.domain.plan_policy import PlanPolicy
+    
+    # 1. Empty plan_id
+    with pytest.raises(DomainException) as exc:
+        PlanPolicy.validate_plan_attributes("", "Name", PlanType.PREPAID, Decimal("10.00"), 30, 10)
+    assert exc.value.reason_code == "ERR_INVALID_PLAN_DATA"
+
+    # 2. Empty name
+    with pytest.raises(DomainException) as exc:
+        PlanPolicy.validate_plan_attributes("PLAN-1", "   ", PlanType.PREPAID, Decimal("10.00"), 30, 10)
+    assert exc.value.reason_code == "ERR_INVALID_PLAN_DATA"
+
+    # 3. Validity <= 0
+    with pytest.raises(DomainException) as exc:
+        PlanPolicy.validate_plan_attributes("PLAN-1", "Plan 1", PlanType.PREPAID, Decimal("10.00"), 0, 10)
+    assert exc.value.reason_code == "ERR_INVALID_PLAN_DATA"
+
+    # 4. Data < 0
+    with pytest.raises(DomainException) as exc:
+        PlanPolicy.validate_plan_attributes("PLAN-1", "Plan 1", PlanType.PREPAID, Decimal("10.00"), 30, -5)
+    assert exc.value.reason_code == "ERR_INVALID_PLAN_DATA"
+
+    # 5. Postpaid rent <= 0
+    with pytest.raises(DomainException) as exc:
+        PlanPolicy.validate_plan_attributes("PLAN-1", "Plan 1", PlanType.POSTPAID, Decimal("0.00"), 30, 10)
+    assert exc.value.reason_code == "ERR_INVALID_PLAN_DATA"
+
+def test_publish_and_query_plans():
+    srv = SubscriptionService()
+    p = srv.create_plan("PLAN-PUB", "Draft Plan", PlanType.PREPAID, Decimal("15.00"), 28, 5, is_published=False)
+    assert len(srv.list_plans(published_only=True)) == 0
+    assert len(srv.list_plans(published_only=False)) == 1
+
+    srv.publish_plan("PLAN-PUB")
+    assert len(srv.list_plans(published_only=True)) == 1
+
+    with pytest.raises(DomainException) as exc:
+        srv.get_plan("PLAN-NON-EXISTENT")
+    assert exc.value.reason_code == "ERR_PLAN_NOT_FOUND"
+

@@ -1,6 +1,7 @@
 import uuid
 import json
 import logging
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Dict, Any, Optional, List
 
@@ -59,11 +60,19 @@ class APIController:
     def handle_activate(self, payload: Dict[str, Any], caller_role: Role, caller_id: str = "DEALER_SYSTEM", correlation_id: Optional[str] = None) -> Dict[str, Any]:
         corr_id = correlation_id or f"REQ-{uuid.uuid4().hex[:8]}"
         try:
+            # Enforce caller authorization: only DEALER, CSR, or ADMIN can activate (NFR-04)
+            if caller_role not in [Role.DEALER, Role.CSR, Role.ADMIN]:
+                raise UnauthorizedException(
+                    f"Role '{caller_role.value if hasattr(caller_role, 'value') else caller_role}' is not authorized to activate subscriptions. Must be DEALER, CSR, or ADMIN.",
+                    "ERR_UNAUTHORIZED"
+                )
+
+            dealer_code = payload.get("dealer_code") or (caller_id if caller_role == Role.DEALER else "DEALER_001")
             sub = self.service.activate_subscriber(
                 subscriber_id=payload["subscriber_id"],
                 kyc_status=payload["kyc_status"],
-                dealer_code=payload["dealer_code"],
-                mnp_status=payload["mnp_status"],
+                dealer_code=dealer_code,
+                mnp_status=payload.get("mnp_status", "COMPLETED"),
                 initial_plan_id=payload["initial_plan_id"]
             )
             masked = sub.mask_pii()
@@ -160,13 +169,16 @@ class APIController:
     def handle_csr_override(self, payload: Dict[str, Any], caller_role: Role, caller_id: str, correlation_id: Optional[str] = None) -> Dict[str, Any]:
         corr_id = correlation_id or f"REQ-{uuid.uuid4().hex[:8]}"
         try:
-            CSROverridePolicy.validate_override_request(caller_role, payload.get("reason_code", ""))
+            rejection_id = payload.get("rejection_id")
+            CSROverridePolicy.validate_override_request(caller_role, payload.get("reason_code", ""), rejection_id)
             sub = self.service.csr_override_activation(
                 subscriber_id=payload["subscriber_id"],
                 initial_plan_id=payload["initial_plan_id"],
                 actor_id=caller_id,
-                reason_code=payload["reason_code"]
+                reason_code=payload["reason_code"],
+                rejection_id=rejection_id
             )
+            self._format_log(corr_id, "CSR_OVERRIDE", caller_id, sub.mask_pii()["masked_subscriber_id"], "CSR override activation succeeded")
             return {"status": "SUCCESS", "correlation_id": corr_id, "data": sub.mask_pii()}
         except DomainException as e:
             return {"status": "ERROR", "correlation_id": corr_id, "reason_code": e.reason_code, "message": e.message}
@@ -176,6 +188,7 @@ class APIController:
         if caller_role not in [Role.ADMIN, Role.CSR]:
             return {"status": "ERROR", "correlation_id": corr_id, "reason_code": "ERR_UNAUTHORIZED", "message": "Only Admins and CSRs can view operational reports"}
 
+        self._format_log(corr_id, "REPORTS_ACCESSED", caller_role.value if hasattr(caller_role, "value") else str(caller_role), "N/A", "Operational summary reports accessed")
         summary = self.reporting_service.get_dashboard_summary()
         # Convert Decimal objects to strings for clean JSON serialization
         summary["activation_funnel"]["conversion_rate_percentage"] = str(summary["activation_funnel"]["conversion_rate_percentage"])
@@ -186,3 +199,105 @@ class APIController:
         summary["arpu"]["arpu"] = str(summary["arpu"]["arpu"])
 
         return {"status": "SUCCESS", "correlation_id": corr_id, "data": summary}
+
+    def handle_terminate(self, payload: Dict[str, Any], caller_role: Role, caller_id: str, correlation_id: Optional[str] = None) -> Dict[str, Any]:
+        corr_id = correlation_id or f"REQ-{uuid.uuid4().hex[:8]}"
+        try:
+            if caller_role not in [Role.CSR, Role.ADMIN]:
+                raise UnauthorizedException("Only CSR or ADMIN roles can terminate subscriptions", "ERR_UNAUTHORIZED")
+            sub_id = payload["subscriber_id"]
+            reason = payload.get("reason", "ACCOUNT_CLOSED")
+            sub = self.service.terminate_subscriber(sub_id, reason=reason, actor=caller_id, role=caller_role)
+            self._format_log(corr_id, "TERMINATE", caller_id, sub.mask_pii()["masked_subscriber_id"], f"Subscription terminated: {reason}")
+            return {"status": "SUCCESS", "correlation_id": corr_id, "data": sub.mask_pii()}
+        except DomainException as e:
+            return {"status": "ERROR", "correlation_id": corr_id, "reason_code": e.reason_code, "message": e.message}
+
+    def handle_finalize_port_out(self, payload: Dict[str, Any], caller_role: Role, caller_id: str, correlation_id: Optional[str] = None) -> Dict[str, Any]:
+        corr_id = correlation_id or f"REQ-{uuid.uuid4().hex[:8]}"
+        try:
+            if caller_role not in [Role.CSR, Role.ADMIN]:
+                raise UnauthorizedException("Only CSR or ADMIN roles can finalize port-out", "ERR_UNAUTHORIZED")
+            sub_id = payload["subscriber_id"]
+            force_override = bool(payload.get("force_override", False))
+            override_reason = payload.get("override_reason")
+            sub = self.service.finalize_port_out(
+                subscriber_id=sub_id,
+                force_override=force_override,
+                enforce_cooling_period=True,
+                caller_role=caller_role,
+                override_reason=override_reason,
+                actor=caller_id
+            )
+            self._format_log(corr_id, "PORT_OUT_FINALIZED", caller_id, sub.mask_pii()["masked_subscriber_id"], "Port-out finalized")
+            return {"status": "SUCCESS", "correlation_id": corr_id, "data": sub.mask_pii()}
+        except DomainException as e:
+            return {"status": "ERROR", "correlation_id": corr_id, "reason_code": e.reason_code, "message": e.message}
+
+    def handle_pro_rata_preview(
+        self,
+        payload: Dict[str, Any],
+        caller_role: Optional[Role] = None,
+        caller_id: Optional[str] = None,
+        correlation_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        corr_id = correlation_id or f"REQ-{uuid.uuid4().hex[:8]}"
+        try:
+            sub_id = payload["subscriber_id"]
+            if caller_role is not None and caller_id is not None:
+                self._verify_subscriber_access(sub_id, caller_role, caller_id)
+
+            new_plan_id = payload["new_plan_id"]
+            days_used = payload.get("days_used")
+            cycle_days = payload.get("cycle_days", 30)
+            sub = self.service.get_subscriber(sub_id)
+            if not sub.current_plan_id:
+                raise DomainException("Subscriber has no active plan to preview migration from", "ERR_NO_ACTIVE_PLAN", http_status=422)
+
+            current_plan = self.service.plan_repo.find_latest(sub.current_plan_id)
+            new_plan = self.service.plan_repo.find_latest_published(new_plan_id)
+            if not new_plan:
+                draft = self.service.plan_repo.find_latest(new_plan_id)
+                if draft:
+                    raise DomainException(f"Cannot preview migration to draft or unpublished plan '{new_plan_id}'", "ERR_PLAN_NOT_PUBLISHED", http_status=422)
+                raise DomainException(f"Target plan '{new_plan_id}' not found", "ERR_PLAN_NOT_FOUND", http_status=404)
+
+            if not current_plan:
+                raise DomainException("Current plan configuration not found", "ERR_PLAN_NOT_FOUND", http_status=404)
+
+            from src.domain.plan_change_policy import PlanChangePolicy
+            now = datetime.now(timezone.utc)
+            tenure_anchor = sub.initial_activated_at or sub.plan_activated_at or now
+            served_days = int((now - tenure_anchor).total_seconds() // 86400)
+            tenure_satisfied = served_days >= current_plan.min_tenure_days if current_plan.min_tenure_days > 0 else True
+
+            immediate_mode = days_used is not None or current_plan.plan_type == PlanType.PREPAID
+            preview = PlanChangePolicy.evaluate_migration(
+                current_plan=current_plan,
+                new_plan=new_plan,
+                plan_activated_at=sub.plan_activated_at,
+                initial_activated_at=sub.initial_activated_at,
+                days_used=days_used,
+                cycle_days=cycle_days,
+                immediate_pro_rata=immediate_mode,
+                bypass_tenure=True
+            )
+            return {
+                "status": "SUCCESS",
+                "correlation_id": corr_id,
+                "data": {
+                    "subscriber_id": sub_id,
+                    "masked_subscriber_id": sub.mask_pii()["masked_subscriber_id"],
+                    "current_plan_id": current_plan.plan_id,
+                    "target_plan_id": new_plan.plan_id,
+                    "is_upgrade": preview["is_upgrade"],
+                    "tenure_satisfied": tenure_satisfied,
+                    "min_tenure_days": current_plan.min_tenure_days,
+                    "effective_mode": preview["effective_mode"],
+                    "charge": str(preview["charge"]),
+                    "pro_rata_charge": str(preview["charge"]),
+                    "itemized": {k: str(v) for k, v in preview["itemized"].items()} if preview.get("itemized") else None
+                }
+            }
+        except DomainException as e:
+            return {"status": "ERROR", "correlation_id": corr_id, "reason_code": e.reason_code, "message": e.message}

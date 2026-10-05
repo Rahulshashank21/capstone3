@@ -42,7 +42,3 @@ class SubscriberRepository:
         with self._lock:
             return sum(1 for s in self._subscribers.values() if s.state == state)
 
-    def clear(self) -> None:
-        with self._lock:
-            self._subscribers.clear()
-            self._active_mobile_numbers.clear()

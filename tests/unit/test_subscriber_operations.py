@@ -62,10 +62,14 @@ def test_ac_08_activation_rule_failures(service):
 
 def test_ac_09_csr_override(service):
     """AC-09: CSR override forces activation and records audit trail with actor and timestamp."""
-    sub = service.register_subscriber("9876543210", "ID-REF-999", PlanType.PREPAID)
-    updated_sub = service.csr_override_activation(sub.subscriber_id, "PLAN-PRE-01", "CSR_AGENT_77", "OVERRIDE_KYC_MANUAL")
+    sub = service.register_subscriber("9876543219", "ID-REF-999-CSR", PlanType.PREPAID)
+    with pytest.raises(ActivationFailedException) as exc:
+        service.activate_subscriber(sub.subscriber_id, "REJECTED", "DEALER_001", "APPROVED", "PLAN-PRE-01")
+    rejection_id = exc.value.rejection_id
+
+    updated_sub = service.csr_override_activation(
+        sub.subscriber_id, "PLAN-PRE-01", "CSR_AGENT_77", "OVERRIDE_KYC_MANUAL", rejection_id=rejection_id
+    )
     
     assert updated_sub.state == SubscriberState.ACTIVE
-    assert len(service.audit_logs) == 1
-    assert service.audit_logs[0].actor == "CSR_AGENT_77"
-    assert service.audit_logs[0].reason_code == "OVERRIDE_KYC_MANUAL"
+    assert any(log.actor == "CSR_AGENT_77" and log.reason_code == "OVERRIDE_KYC_MANUAL" for log in service.audit_logs)

@@ -5,48 +5,55 @@ from typing import Dict, Any, List, Optional, Set
 
 from src.domain.models import (
     Subscriber, SubscriberState, PlanVersion, PlanType, AuditLog, Role,
-    BillingRecord, PortOutRecord,
+    BillingRecord, PortOutRecord, RejectionRecord,
     InvalidSubscriberStateException, ActivationFailedException,
     PlanImmutableException, ProRataCalculationException,
     PlanChangeTenureException, CoolingPeriodExpiredException,
     ConsumptionHaltedException, UnauthorizedException, DomainException
 )
-from src.domain.rules import StateMachineValidator, ProRataCalculator, ActivationRuleEngine, ActivationPolicy, PlanPolicy
+from src.domain.rules import (
+    StateMachineValidator, ProRataCalculator, ActivationRuleEngine,
+    ActivationPolicy, PlanPolicy, PlanChangePolicy, PortOutPolicy, SuspensionPolicy, CSROverridePolicy
+)
 from src.repositories.subscriber_repository import SubscriberRepository
 from src.repositories.plan_repository import PlanRepository
 from src.repositories.audit_repository import AuditRepository
 from src.repositories.billing_repository import BillingRepository
+from src.repositories.rejection_repository import RejectionRepository
 
-class PlanDictWrapper(dict):
-    """Dictionary-like wrapper synchronizing dict mutations with PlanRepository."""
+class PlanCatalogProxy(dict):
+    """Dictionary-compatible proxy delegating strictly to PlanRepository public methods under locks."""
     def __init__(self, plan_repo: PlanRepository):
         super().__init__()
-        self.plan_repo = plan_repo
+        self._plan_repo = plan_repo
 
     def __setitem__(self, key: str, value: PlanVersion):
-        super().__setitem__(key, value)
-        self.plan_repo.save(value)
+        self._plan_repo.save(value)
 
     def __getitem__(self, key: str) -> PlanVersion:
-        p = self.plan_repo.find_latest(key)
-        if p is not None:
-            return p
-        return super().__getitem__(key)
+        p = self._plan_repo.find_latest(key)
+        if p is None:
+            raise KeyError(key)
+        return p
 
     def get(self, key: str, default=None):
-        p = self.plan_repo.find_latest(key)
-        if p is not None:
-            return p
-        return super().get(key, default)
+        p = self._plan_repo.find_latest(key)
+        return p if p is not None else default
 
     def values(self):
-        return self.plan_repo.list_all_latest()
+        return self._plan_repo.list_all_latest()
 
     def items(self):
-        return [(p.plan_id, p) for p in self.plan_repo.list_all_latest()]
+        return [(p.plan_id, p) for p in self._plan_repo.list_all_latest()]
 
     def __contains__(self, key):
-        return self.plan_repo.find_latest(key) is not None
+        return self._plan_repo.find_latest(key) is not None
+
+    def __iter__(self):
+        return iter(p.plan_id for p in self._plan_repo.list_all_latest())
+
+    def __len__(self):
+        return len(self._plan_repo.list_all_latest())
 
 class SubscriptionService:
     def __init__(
@@ -54,19 +61,32 @@ class SubscriptionService:
         subscriber_repo: Optional[SubscriberRepository] = None,
         plan_repo: Optional[PlanRepository] = None,
         audit_repo: Optional[AuditRepository] = None,
-        billing_repo: Optional[BillingRepository] = None
+        billing_repo: Optional[BillingRepository] = None,
+        rejection_repo: Optional[Any] = None,
+        port_out_repo: Optional[Any] = None,
+        transition_repo: Optional[Any] = None
     ):
         self.subscriber_repo = subscriber_repo or SubscriberRepository()
         self.plan_repo = plan_repo or PlanRepository()
         self.audit_repo = audit_repo or AuditRepository()
         self.billing_repo = billing_repo or BillingRepository()
+        self.rejection_repo = rejection_repo or RejectionRepository()
+        self.port_out_repo = port_out_repo
+        self.transition_repo = transition_repo
         self.valid_dealers = {"DEALER_001", "DEALER_002", "OFFICIAL_WEB"}
+        self.plans = PlanCatalogProxy(self.plan_repo)
 
-        # Backwards compatibility attributes
-        self.subscribers: Dict[str, Subscriber] = self.subscriber_repo._subscribers
-        self.plans = PlanDictWrapper(self.plan_repo)
-        self.audit_logs: List[AuditLog] = self.audit_repo._logs
-        self.active_numbers: Set[str] = self.subscriber_repo._active_mobile_numbers
+    @property
+    def audit_logs(self) -> List[AuditLog]:
+        return self.audit_repo.list_all()
+
+    @property
+    def subscribers(self) -> Dict[str, Subscriber]:
+        return {s.subscriber_id: s for s in self.subscriber_repo.list_all()}
+
+    @property
+    def active_numbers(self) -> Set[str]:
+        return self.subscriber_repo.get_active_numbers()
 
     # --- Plan Catalog Management (AC-03) ---
 
@@ -138,7 +158,16 @@ class SubscriptionService:
     # --- Subscriber Registration & Activation (AC-01, AC-08) ---
 
     def register_subscriber(self, mobile_number: str, identity_proof_ref: str, preferred_plan_type: PlanType) -> Subscriber:
-        subscriber_id = f"SUB-{uuid.uuid4().hex[:8]}"
+        # Prevent duplicate pending KYC registrations for the same number
+        pending_existing = [s for s in self.subscriber_repo.find_by_mobile(mobile_number) if s.state == SubscriberState.PENDING_KYC]
+        if pending_existing:
+            raise DomainException(
+                f"Mobile number {mobile_number} already has a pending registration awaiting KYC verification",
+                "ERR_DUPLICATE_MOBILE_NUMBER",
+                http_status=409
+            )
+
+        subscriber_id = f"SUB-{uuid.uuid4().hex}"
         subscriber = Subscriber(
             subscriber_id=subscriber_id,
             mobile_number=mobile_number,
@@ -160,14 +189,28 @@ class SubscriptionService:
         sub = self.get_subscriber(subscriber_id)
         StateMachineValidator.validate_transition(sub.state, SubscriberState.ACTIVE)
 
-        ActivationPolicy.validate_activation(
-            kyc_status=kyc_status,
-            dealer_code=dealer_code,
-            mnp_status=mnp_status,
-            mobile_number=sub.mobile_number,
-            active_numbers=self.subscriber_repo.get_active_numbers(),
-            valid_dealers=list(self.valid_dealers)
-        )
+        try:
+            ActivationPolicy.validate_activation(
+                kyc_status=kyc_status,
+                dealer_code=dealer_code,
+                mnp_status=mnp_status,
+                mobile_number=sub.mobile_number,
+                active_numbers=self.subscriber_repo.get_active_numbers(),
+                valid_dealers=list(self.valid_dealers)
+            )
+        except ActivationFailedException as e:
+            rej_id = f"REJ-{uuid.uuid4().hex}"
+            self.rejection_repo.append(RejectionRecord(
+                rejection_id=rej_id,
+                subscriber_id=sub.subscriber_id,
+                stage="ACTIVATION",
+                rule=e.reason_code,
+                reason_code=e.reason_code,
+                details=str(e),
+                timestamp=datetime.now(timezone.utc)
+            ))
+            e.rejection_id = rej_id
+            raise e
 
         plan = self.plan_repo.find_latest(initial_plan_id)
         if not plan:
@@ -181,12 +224,13 @@ class SubscriptionService:
 
         # Audit activation
         self.audit_repo.append(AuditLog(
-            log_id=f"AUD-{uuid.uuid4().hex[:8]}",
+            log_id=f"AUD-{uuid.uuid4().hex}",
             actor=dealer_code,
             role=Role.DEALER,
             action="SUBSCRIBER_ACTIVATED",
             reason_code="ACTIVATION_SUCCESS",
-            details=f"Subscriber {sub.mask_pii()['subscriber_id']} successfully activated on plan {initial_plan_id}"
+            details=f"Subscriber {sub.mask_pii()['masked_subscriber_id']} successfully activated on plan {initial_plan_id}",
+            masked_subscriber_id=sub.mask_pii()["masked_subscriber_id"]
         ))
 
         return sub
@@ -198,10 +242,40 @@ class SubscriptionService:
         subscriber_id: str,
         initial_plan_id: str,
         actor_id: str,
-        reason_code: str
+        reason_code: str,
+        rejection_id: Optional[str] = None
     ) -> Subscriber:
+        CSROverridePolicy.validate_override_request(Role.CSR, reason_code, rejection_id)
+        
+        # Link and validate rejection record
+        effective_rejection_id = rejection_id
+        if effective_rejection_id:
+            rejection = self.rejection_repo.find_by_id(effective_rejection_id)
+            if not rejection or rejection.subscriber_id != subscriber_id:
+                raise DomainException(
+                    f"Rejection record '{effective_rejection_id}' does not exist or does not match subscriber '{subscriber_id}'",
+                    "ERR_INVALID_REJECTION_ID",
+                    http_status=404
+                )
+        else:
+            prior_rejections = self.rejection_repo.list_by_subscriber(subscriber_id)
+            if not prior_rejections:
+                raise DomainException(
+                    "rejection_id or prior activation rejection record is required for CSR override",
+                    "ERR_REJECTION_REQUIRED",
+                    http_status=422
+                )
+            effective_rejection_id = prior_rejections[0].rejection_id
+
         sub = self.get_subscriber(subscriber_id)
         StateMachineValidator.validate_transition(sub.state, SubscriberState.ACTIVE)
+
+        # Enforce active mobile number exclusivity (NFR-08)
+        if sub.mobile_number in self.subscriber_repo.get_active_numbers():
+            raise ActivationFailedException(
+                "Mobile number already holds an ACTIVE subscription on the network",
+                "ERR_DUPLICATE_ACTIVE_NUMBER"
+            )
 
         plan = self.plan_repo.find_latest(initial_plan_id)
         if not plan:
@@ -209,17 +283,22 @@ class SubscriptionService:
 
         sub.state = SubscriberState.ACTIVE
         sub.current_plan_id = initial_plan_id
-        sub.plan_activated_at = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)
+        sub.plan_activated_at = now
+        if not sub.initial_activated_at:
+            sub.initial_activated_at = now
         sub.is_consumption_active = True
         self.subscriber_repo.save(sub)
 
         audit = AuditLog(
-            log_id=f"AUD-{uuid.uuid4().hex[:8]}",
+            log_id=f"AUD-{uuid.uuid4().hex}",
             actor=actor_id,
             role=Role.CSR,
             action="CSR_ACTIVATION_OVERRIDE",
             reason_code=reason_code,
-            details=f"Overrode activation failure for subscriber {subscriber_id}"
+            details=f"Overrode activation failure ({effective_rejection_id}) for subscriber {sub.mask_pii()['masked_subscriber_id']}",
+            masked_subscriber_id=sub.mask_pii()["masked_subscriber_id"],
+            timestamp=now
         )
         self.audit_repo.append(audit)
         return sub
@@ -251,6 +330,7 @@ class SubscriptionService:
         new_plan_id: str,
         days_used: int = 0,
         cycle_days: int = 30,
+        immediate_pro_rata: bool = True,
         bypass_tenure: bool = False,
         actor_id: Optional[str] = None,
         override_reason: Optional[str] = None
@@ -264,44 +344,58 @@ class SubscriptionService:
         if not current_plan or not new_plan:
             raise DomainException("Plan configuration error", "ERR_PLAN_NOT_FOUND")
 
-        # Tenure validation (AC-04)
-        if not bypass_tenure:
-            PlanPolicy.validate_tenure_requirement(current_plan, sub.plan_activated_at)
+        # Validate migration policy, published status, identical plan, family compatibility, tenure, and billing
+        eval_result = PlanChangePolicy.evaluate_migration(
+            current_plan=current_plan,
+            new_plan=new_plan,
+            plan_activated_at=sub.plan_activated_at,
+            initial_activated_at=sub.initial_activated_at,
+            days_used=days_used,
+            cycle_days=cycle_days,
+            immediate_pro_rata=immediate_pro_rata,
+            bypass_tenure=bypass_tenure
+        )
 
-        pro_rata_charge = Decimal("0.00")
-        effective_date = datetime.now(timezone.utc)
+        immediate_apply = eval_result.get("immediate_apply", True)
+        pro_rata_charge = eval_result["charge"]
+        effective_date = eval_result["effective_from"]
 
-        if current_plan.plan_type == PlanType.POSTPAID:
-            pro_rata_charge = ProRataCalculator.calculate(
-                old_rent=current_plan.monthly_rent,
-                new_rent=new_plan.monthly_rent,
-                days_used=days_used,
-                cycle_days=cycle_days
-            )
-            # Record billing transaction
-            self.billing_repo.append(BillingRecord(
-                record_id=f"BIL-{uuid.uuid4().hex[:8]}",
-                subscriber_id=sub.subscriber_id,
-                plan_id=new_plan_id,
-                amount=pro_rata_charge,
-                description=f"Mid-cycle migration {current_plan.plan_id} -> {new_plan.plan_id}",
-                days_used=days_used,
-                cycle_days=cycle_days
-            ))
+        if immediate_apply:
+            if current_plan.plan_type == PlanType.POSTPAID:
+                # Record billing transaction
+                self.billing_repo.append(BillingRecord(
+                    record_id=f"BIL-{uuid.uuid4().hex}",
+                    subscriber_id=sub.subscriber_id,
+                    plan_id=new_plan_id,
+                    amount=pro_rata_charge,
+                    description=f"Mid-cycle migration {current_plan.plan_id} -> {new_plan.plan_id}",
+                    days_used=days_used,
+                    cycle_days=cycle_days
+                ))
 
-        sub.current_plan_id = new_plan_id
-        sub.plan_activated_at = effective_date
+            sub.current_plan_id = new_plan_id
+            sub.plan_activated_at = effective_date
+            sub.pending_plan_id = None
+            sub.pending_plan_effective_from = None
+        else:
+            # AC-04 Next cycle migration
+            sub.pending_plan_id = new_plan_id
+            sub.pending_plan_effective_from = effective_date
+
         self.subscriber_repo.save(sub)
 
         # Audit plan change
-        action_name = "PLAN_CHANGE_CSR_OVERRIDE" if bypass_tenure else "PLAN_CHANGE"
+        action_name = "PLAN_CHANGE_CSR_OVERRIDE" if bypass_tenure else (
+            "PLAN_CHANGE" if immediate_apply else "PLAN_CHANGE_SCHEDULED"
+        )
         self.audit_repo.append(AuditLog(
-            log_id=f"AUD-{uuid.uuid4().hex[:8]}",
+            log_id=f"AUD-{uuid.uuid4().hex}",
             actor=actor_id or sub.subscriber_id,
             role=Role.CSR if bypass_tenure else Role.SUBSCRIBER,
             action=action_name,
             reason_code=override_reason or "SUBSCRIBER_REQUEST",
-            details=f"Plan changed from {current_plan.plan_id} to {new_plan.plan_id}. Pro-rata charge: ${pro_rata_charge}"
+            details=f"Plan migration {current_plan.plan_id} -> {new_plan.plan_id} (effective: {eval_result['effective_mode']}). Charge: ${pro_rata_charge}",
+            masked_subscriber_id=sub.mask_pii()["masked_subscriber_id"]
         ))
 
         return {
@@ -309,113 +403,185 @@ class SubscriptionService:
             "old_plan_id": current_plan.plan_id,
             "new_plan_id": new_plan.plan_id,
             "pro_rata_charge": pro_rata_charge,
-            "effective_date": effective_date.isoformat()
+            "effective_date": effective_date.isoformat(),
+            "effective_mode": eval_result.get("effective_mode", "IMMEDIATE")
         }
+
+    def apply_cycle_boundary_migrations(self, as_of_time: Optional[datetime] = None) -> List[Subscriber]:
+        """Processes all scheduled plan changes whose cycle boundary has arrived (AC-04)."""
+        now = as_of_time or datetime.now(timezone.utc)
+        migrated = []
+        for sub in self.subscriber_repo.list_all():
+            if sub.pending_plan_id and sub.pending_plan_effective_from and sub.pending_plan_effective_from <= now:
+                old_plan_id = sub.current_plan_id
+                sub.current_plan_id = sub.pending_plan_id
+                sub.plan_activated_at = sub.pending_plan_effective_from
+                sub.pending_plan_id = None
+                sub.pending_plan_effective_from = None
+                self.subscriber_repo.save(sub)
+                migrated.append(sub)
+                self.audit_repo.append(AuditLog(
+                    log_id=f"AUD-{uuid.uuid4().hex}",
+                    actor="BILLING_CYCLE_SCHEDULER",
+                    role=Role.ADMIN,
+                    action="PLAN_CHANGE_CYCLE_BOUNDARY",
+                    reason_code="CYCLE_BOUNDARY_TRANSITION",
+                    details=f"Pending plan {sub.current_plan_id} applied at cycle boundary from {old_plan_id}",
+                    masked_subscriber_id=sub.mask_pii()["masked_subscriber_id"],
+                    timestamp=now
+                ))
+        return migrated
 
     # --- Suspension & Consumption Halting (AC-06) ---
 
-    def suspend_subscriber(self, subscriber_id: str, reason: str = "REQUESTED_BY_USER") -> Subscriber:
+    # --- Suspension & Consumption Halting (AC-06) ---
+
+    def suspend_subscriber(self, subscriber_id: str, reason: str = "REQUESTED_BY_USER", actor: Optional[str] = None, role: Role = Role.SUBSCRIBER) -> Subscriber:
         sub = self.get_subscriber(subscriber_id)
-        StateMachineValidator.validate_transition(sub.state, SubscriberState.SUSPENDED)
-        sub.state = SubscriberState.SUSPENDED
-        sub.is_consumption_active = False
+        SuspensionPolicy.validate_suspension(sub, reason)
+        SuspensionPolicy.apply_suspension(sub, reason)
         self.subscriber_repo.save(sub)
 
+        now = datetime.now(timezone.utc)
         self.audit_repo.append(AuditLog(
-            log_id=f"AUD-{uuid.uuid4().hex[:8]}",
-            actor=sub.subscriber_id,
-            role=Role.SUBSCRIBER,
+            log_id=f"AUD-{uuid.uuid4().hex}",
+            actor=actor or sub.subscriber_id,
+            role=role,
             action="SUBSCRIBER_SUSPENDED",
             reason_code=reason,
-            details="Subscriber entered SUSPENDED state; consumption halted"
+            details=f"Subscriber entered SUSPENDED state from {sub.previous_state.value if sub.previous_state else 'ACTIVE'}; consumption halted",
+            masked_subscriber_id=sub.mask_pii()["masked_subscriber_id"],
+            timestamp=now
         ))
         return sub
 
-    def reactivate_subscriber(self, subscriber_id: str) -> Subscriber:
+    def reactivate_subscriber(self, subscriber_id: str, actor: Optional[str] = None, role: Role = Role.SUBSCRIBER) -> Subscriber:
         sub = self.get_subscriber(subscriber_id)
-        StateMachineValidator.validate_transition(sub.state, SubscriberState.ACTIVE)
-        sub.state = SubscriberState.ACTIVE
-        sub.is_consumption_active = True
+        # AC-06: Strict guard - only SUSPENDED subscribers can be reactivated
+        SuspensionPolicy.validate_reactivation(sub)
+        SuspensionPolicy.apply_reactivation(sub)
         self.subscriber_repo.save(sub)
 
+        now = datetime.now(timezone.utc)
         self.audit_repo.append(AuditLog(
-            log_id=f"AUD-{uuid.uuid4().hex[:8]}",
-            actor=sub.subscriber_id,
-            role=Role.SUBSCRIBER,
+            log_id=f"AUD-{uuid.uuid4().hex}",
+            actor=actor or sub.subscriber_id,
+            role=role,
             action="SUBSCRIBER_REACTIVATED",
             reason_code="SERVICE_RESUMED",
-            details="Subscriber restored to ACTIVE state; consumption resumed"
+            details="Subscriber restored to prior state; consumption resumed",
+            masked_subscriber_id=sub.mask_pii()["masked_subscriber_id"],
+            timestamp=now
         ))
         return sub
 
     def assert_can_consume(self, subscriber_id: str) -> bool:
         sub = self.get_subscriber(subscriber_id)
-        if sub.state != SubscriberState.ACTIVE or not sub.is_consumption_active:
-            raise ConsumptionHaltedException(
-                f"Network consumption halted for subscriber in state {sub.state}",
-                "ERR_CONSUMPTION_HALTED"
-            )
+        SuspensionPolicy.assert_consumption_permitted(sub)
         return True
 
     # --- Port-Out Cooling Period State Machine (AC-07) ---
 
     def initiate_port_out(self, subscriber_id: str, recipient_operator: str = "REC_OPERATOR_01") -> Subscriber:
         sub = self.get_subscriber(subscriber_id)
-        StateMachineValidator.validate_transition(sub.state, SubscriberState.PORT_OUT_REQUESTED)
-        sub.state = SubscriberState.PORT_OUT_REQUESTED
-        sub.port_out_requested_at = datetime.now(timezone.utc)
+        validated_op = PortOutPolicy.validate_initiation(sub, recipient_operator)
+        now = datetime.now(timezone.utc)
+        PortOutPolicy.apply_initiation(sub, now)
         self.subscriber_repo.save(sub)
 
         self.audit_repo.append(AuditLog(
-            log_id=f"AUD-{uuid.uuid4().hex[:8]}",
+            log_id=f"AUD-{uuid.uuid4().hex}",
             actor=sub.subscriber_id,
             role=Role.SUBSCRIBER,
             action="PORT_OUT_INITIATED",
             reason_code="REGULATORY_COOLING_STARTED",
-            details=f"Port-out initiated to {recipient_operator}. 7-day cooling period active."
+            details=f"Port-out initiated to {validated_op.value}. 7-day cooling period active.",
+            masked_subscriber_id=sub.mask_pii()["masked_subscriber_id"],
+            timestamp=now
         ))
         return sub
 
     def cancel_port_out(self, subscriber_id: str) -> Subscriber:
         sub = self.get_subscriber(subscriber_id)
-        if sub.state != SubscriberState.PORT_OUT_REQUESTED:
-            raise InvalidSubscriberStateException("Subscriber is not in PORT_OUT_REQUESTED state", "ERR_INVALID_STATE")
-        
-        if sub.port_out_requested_at and (datetime.now(timezone.utc) - sub.port_out_requested_at) > timedelta(days=7):
-            raise InvalidSubscriberStateException("Cooling period of 7 days has expired", "ERR_COOLING_PERIOD_EXPIRED")
-
-        StateMachineValidator.validate_transition(sub.state, SubscriberState.ACTIVE)
-        sub.state = SubscriberState.ACTIVE
-        sub.port_out_requested_at = None
+        now = datetime.now(timezone.utc)
+        PortOutPolicy.validate_cancellation(sub, current_time=now)
+        PortOutPolicy.apply_cancellation(sub)
         self.subscriber_repo.save(sub)
 
         self.audit_repo.append(AuditLog(
-            log_id=f"AUD-{uuid.uuid4().hex[:8]}",
+            log_id=f"AUD-{uuid.uuid4().hex}",
             actor=sub.subscriber_id,
             role=Role.SUBSCRIBER,
             action="PORT_OUT_CANCELLED",
             reason_code="CUSTOMER_RETENTION",
-            details="Subscriber cancelled port-out request within 7-day window. Restored to ACTIVE."
+            details="Subscriber cancelled port-out request within 7-day window. Restored to ACTIVE.",
+            masked_subscriber_id=sub.mask_pii()["masked_subscriber_id"],
+            timestamp=now
         ))
         return sub
 
-    def finalize_port_out(self, subscriber_id: str) -> Subscriber:
+    def finalize_port_out(
+        self,
+        subscriber_id: str,
+        force_override: bool = False,
+        enforce_cooling_period: bool = True,
+        caller_role: Optional[Role] = None,
+        override_reason: Optional[str] = None,
+        actor: Optional[str] = None
+    ) -> Subscriber:
         sub = self.get_subscriber(subscriber_id)
-        if sub.state != SubscriberState.PORT_OUT_REQUESTED:
-            raise InvalidSubscriberStateException("Subscriber is not in PORT_OUT_REQUESTED state", "ERR_INVALID_STATE")
+        now = datetime.now(timezone.utc)
+        if enforce_cooling_period:
+            PortOutPolicy.validate_finalization(
+                sub,
+                current_time=now,
+                force_override=force_override,
+                caller_role=caller_role,
+                override_reason=override_reason
+            )
+        else:
+            StateMachineValidator.validate_transition(sub.state, SubscriberState.PORTED_OUT)
+        PortOutPolicy.apply_finalization(sub)
+        self.subscriber_repo.save(sub)
 
-        StateMachineValidator.validate_transition(sub.state, SubscriberState.PORTED_OUT)
-        sub.state = SubscriberState.PORTED_OUT
+        action_name = "PORT_OUT_FINALIZED_OVERRIDE" if force_override else "PORT_OUT_FINALIZED"
+        reason = override_reason if force_override else "COOLING_PERIOD_ELAPSED"
+        self.audit_repo.append(AuditLog(
+            log_id=f"AUD-{uuid.uuid4().hex}",
+            actor=actor or "SYSTEM_MNP_JOB",
+            role=caller_role or Role.ADMIN,
+            action=action_name,
+            reason_code=reason,
+            details=f"Port-out finalized for {sub.mask_pii()['masked_subscriber_id']}. Mobile number released.",
+            masked_subscriber_id=sub.mask_pii()["masked_subscriber_id"],
+            timestamp=now
+        ))
+        return sub
+
+    def terminate_subscriber(
+        self,
+        subscriber_id: str,
+        reason: str = "ACCOUNT_CLOSED",
+        actor: str = "CSR_SYSTEM",
+        role: Role = Role.CSR
+    ) -> Subscriber:
+        sub = self.get_subscriber(subscriber_id)
+        from_state = sub.state
+        StateMachineValidator.validate_transition(from_state, SubscriberState.TERMINATED)
+        sub.state = SubscriberState.TERMINATED
         sub.is_consumption_active = False
         self.subscriber_repo.save(sub)
 
+        now = datetime.now(timezone.utc)
         self.audit_repo.append(AuditLog(
-            log_id=f"AUD-{uuid.uuid4().hex[:8]}",
-            actor="SYSTEM_MNP_JOB",
-            role=Role.ADMIN,
-            action="PORT_OUT_FINALIZED",
-            reason_code="COOLING_PERIOD_ELAPSED",
-            details=f"Port-out finalized for {sub.mask_pii()['subscriber_id']}. Mobile number released."
+            log_id=f"AUD-{uuid.uuid4().hex}",
+            actor=actor,
+            role=role,
+            action="SUBSCRIBER_TERMINATED",
+            reason_code=f"TERMINATED_{reason.upper()}",
+            details=f"Subscriber terminated from {from_state.value}. State: TERMINATED.",
+            masked_subscriber_id=sub.mask_pii()["masked_subscriber_id"],
+            timestamp=now
         ))
         return sub
 

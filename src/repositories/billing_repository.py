@@ -26,6 +26,3 @@ class BillingRepository:
         with self._lock:
             return len(self._records)
 
-    def clear(self) -> None:
-        with self._lock:
-            self._records.clear()

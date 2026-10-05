@@ -94,3 +94,50 @@ def test_ac_04_cannot_change_plan_if_not_active(service):
     with pytest.raises(InvalidSubscriberStateException) as exc_info:
         service.change_plan(sub.subscriber_id, "PLAN-PRE-B")
     assert exc_info.value.reason_code == "ERR_NOT_ACTIVE"
+
+def test_plan_change_draft_plan_rejected(service):
+    """Cannot migrate to unpublished draft plan."""
+    service.create_plan("PLAN-DRAFT", "Draft Plan", PlanType.PREPAID, Decimal("10.00"), 28, 5, is_published=False)
+    sub = service.register_subscriber("9876543214", "ID-555", PlanType.PREPAID)
+    service.activate_subscriber(sub.subscriber_id, "VERIFIED", "DEALER_001", "APPROVED", "PLAN-PRE-A")
+
+    from src.domain.models import DomainException
+    with pytest.raises(DomainException) as exc:
+        service.change_plan(sub.subscriber_id, "PLAN-DRAFT")
+    assert exc.value.reason_code == "ERR_PLAN_NOT_PUBLISHED"
+
+def test_plan_change_identical_plan_rejected(service):
+    """Cannot migrate to the identical currently enrolled plan."""
+    sub = service.register_subscriber("9876543215", "ID-666", PlanType.PREPAID)
+    service.activate_subscriber(sub.subscriber_id, "VERIFIED", "DEALER_001", "APPROVED", "PLAN-PRE-A")
+
+    from src.domain.models import DomainException
+    with pytest.raises(DomainException) as exc:
+        service.change_plan(sub.subscriber_id, "PLAN-PRE-A")
+    assert exc.value.reason_code == "ERR_IDENTICAL_PLAN_MIGRATION"
+
+def test_plan_change_incompatible_family_rejected(service):
+    """Cannot migrate cross-family (Prepaid to Postpaid) directly."""
+    sub = service.register_subscriber("9876543216", "ID-777", PlanType.PREPAID)
+    service.activate_subscriber(sub.subscriber_id, "VERIFIED", "DEALER_001", "APPROVED", "PLAN-PRE-A")
+
+    from src.domain.models import DomainException
+    with pytest.raises(DomainException) as exc:
+        service.change_plan(sub.subscriber_id, "PLAN-POST-UPGRADE")
+    assert exc.value.reason_code == "ERR_INCOMPATIBLE_PLAN_FAMILY"
+
+def test_csr_override_plan_change_bypasses_tenure(service):
+    """CSR override successfully bypasses minimum tenure requirement."""
+    sub = service.register_subscriber("9876543217", "ID-888", PlanType.POSTPAID)
+    service.activate_subscriber(sub.subscriber_id, "VERIFIED", "DEALER_001", "APPROVED", "PLAN-POST-TENURED")
+
+    res = service.csr_override_plan_change(
+        subscriber_id=sub.subscriber_id,
+        new_plan_id="PLAN-POST-UPGRADE",
+        actor_id="CSR_HERO",
+        reason_code="OVERRIDE_TENURE_EXCEPTION",
+        days_used=10,
+        cycle_days=30
+    )
+    assert res["new_plan_id"] == "PLAN-POST-UPGRADE"
+    assert service.get_subscriber(sub.subscriber_id).current_plan_id == "PLAN-POST-UPGRADE"

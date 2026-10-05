@@ -31,6 +31,17 @@ class PlanRepository:
             latest_version_num = max(versions.keys())
             return versions[latest_version_num]
 
+    def find_latest_published(self, plan_id: str) -> Optional[PlanVersion]:
+        with self._lock:
+            versions = self._catalog.get(plan_id)
+            if not versions:
+                return None
+            published = {v_num: p for v_num, p in versions.items() if p.is_published}
+            if not published:
+                return None
+            latest_v = max(published.keys())
+            return published[latest_v]
+
     def find_by_version(self, plan_id: str, version: int) -> Optional[PlanVersion]:
         with self._lock:
             versions = self._catalog.get(plan_id)
@@ -55,6 +66,3 @@ class PlanRepository:
         with self._lock:
             return sum(len(v) for v in self._catalog.values())
 
-    def clear(self) -> None:
-        with self._lock:
-            self._catalog.clear()
