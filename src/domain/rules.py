@@ -1,31 +1,19 @@
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Set
+
 from src.domain.models import (
     Subscriber, SubscriberState, PlanVersion, PlanType,
-    InvalidSubscriberStateException, ActivationFailedException, ProRataCalculationException
+    InvalidSubscriberStateException, ActivationFailedException,
+    ProRataCalculationException, PlanChangeTenureException
 )
-
-class StateMachineValidator:
-    VALID_TRANSITIONS: Dict[SubscriberState, List[SubscriberState]] = {
-        SubscriberState.PENDING_KYC: [SubscriberState.ACTIVE, SubscriberState.TERMINATED],
-        SubscriberState.ACTIVE: [SubscriberState.SUSPENDED, SubscriberState.PORT_OUT_REQUESTED, SubscriberState.TERMINATED],
-        SubscriberState.SUSPENDED: [SubscriberState.ACTIVE, SubscriberState.TERMINATED],
-        SubscriberState.PORT_OUT_REQUESTED: [SubscriberState.ACTIVE, SubscriberState.PORTED_OUT, SubscriberState.TERMINATED],
-        SubscriberState.PORTED_OUT: [],
-        SubscriberState.TERMINATED: []
-    }
-
-    @classmethod
-    def validate_transition(cls, current: SubscriberState, target: SubscriberState) -> None:
-        allowed = cls.VALID_TRANSITIONS.get(current, [])
-        if target not in allowed:
-            raise InvalidSubscriberStateException(
-                f"Invalid lifecycle transition from {current} to {target}",
-                "ERR_INVALID_STATE_TRANSITION"
-            )
+from src.domain.state_machine import StateMachineValidator
+from src.domain.activation_policy import ActivationPolicy
+from src.domain.plan_policy import PlanPolicy
 
 class ProRataCalculator:
+    """Fixed-point pro-rata billing calculator enforcing non-negative invariants."""
+
     @staticmethod
     def calculate(old_rent: Decimal, new_rent: Decimal, days_used: int, cycle_days: int) -> Decimal:
         if cycle_days <= 0:
@@ -47,6 +35,8 @@ class ProRataCalculator:
         return total
 
 class ActivationRuleEngine:
+    """Facade for activation rule evaluation."""
+
     @staticmethod
     def evaluate(kyc_status: str, dealer_code: str, mnp_status: str, valid_dealers: List[str]) -> None:
         if kyc_status != "VERIFIED":
@@ -55,3 +45,11 @@ class ActivationRuleEngine:
             raise ActivationFailedException("Invalid dealer code provided", "ERR_INVALID_DEALER")
         if mnp_status == "REJECTED":
             raise ActivationFailedException("MNP porting validation failed downstream", "ERR_MNP_REJECTED")
+
+__all__ = [
+    "StateMachineValidator",
+    "ProRataCalculator",
+    "ActivationRuleEngine",
+    "ActivationPolicy",
+    "PlanPolicy"
+]

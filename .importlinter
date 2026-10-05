@@ -1,0 +1,23 @@
+[importlinter]
+root_package = src
+
+[importlinter:contract:1]
+name = Domain layer architectural isolation
+type = forbidden
+source_modules =
+    src.domain
+forbidden_modules =
+    src.controllers
+    src.services
+    src.repositories
+    fastapi
+    flask
+
+[importlinter:contract:2]
+name = Layered dependency rule (controllers -> services -> repositories -> domain)
+type = layers
+layers =
+    src.controllers
+    src.services
+    src.repositories
+    src.domain
