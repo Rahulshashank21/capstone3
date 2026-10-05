@@ -1,0 +1,11 @@
+{
+  "name": "telcolane-subscriber-operations-substrate",
+  "version": "1.0.0",
+  "description": "Telecom Subscriber Lifecycle & Plan Management Substrate Plugin",
+  "entry": ".claude/agents/",
+  "hooks": ".claude/hooks/",
+  "skills": ".claude/skills/",
+  "mcpServers": [
+    "playwright"
+  ]
+}
