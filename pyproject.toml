@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telcolane"
+version = "1.0.0"
+description = "Subscriber & Plan Lifecycle Management Platform"
+authors = [{ name = "AI-Native Engineer", email = "engineer@telcolane.ai" }]
+dependencies = [
+    "fastapi>=0.109.0",
+    "uvicorn>=0.27.0",
+    "pydantic>=2.5.0",
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "coverage>=7.4.0",
+    "httpx>=0.26.0"
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["*/__pycache__/*", "*/tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 85

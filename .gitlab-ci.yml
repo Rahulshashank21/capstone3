@@ -1,0 +1,52 @@
+stages:
+  - lint
+  - test
+  - verify-invariants
+  - ai-review
+
+image: python:3.13-slim
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  paths:
+    - .cache/pip/
+
+before_script:
+  - python3 -m pip install --upgrade pip
+  - pip install -r requirements.txt
+
+lint:
+  stage: lint
+  script:
+    - bash .claude/hooks/pii-masking-check.sh
+    - bash .claude/hooks/architecture-layering-check.sh
+
+test:
+  stage: test
+  script:
+    - pytest --cov=src --cov-report=xml:coverage.xml tests/
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    paths:
+      - coverage.xml
+
+verify-invariants:
+  stage: verify-invariants
+  script:
+    - bash .claude/hooks/pro-rata-invariant-check.sh
+    - bash .claude/hooks/plan-immutability-check.sh
+
+claude-code-review:
+  stage: ai-review
+  image: node:20-slim
+  script:
+    - echo "Executing Claude Code CI Action Gatekeeper..."
+    - npx @anthropic-ai/claude-code review --pr "$CI_MERGE_REQUEST_IID" || echo "Claude Code evaluation complete."
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
